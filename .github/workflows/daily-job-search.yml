@@ -1,0 +1,127 @@
+name: Daily Job Search & Application
+
+on:
+  schedule:
+    # Runs daily at 9:00 AM UTC
+    - cron: '0 9 * * *'
+  
+  # Allow manual trigger from Actions tab
+  workflow_dispatch:
+
+jobs:
+  job-application:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Create data directory
+      run: mkdir -p data logs
+    
+    - name: Decode and save resume
+      env:
+        RESUME_BASE64: ${{ secrets.RESUME_BASE64 }}
+      run: |
+        if [ ! -z "$RESUME_BASE64" ]; then
+          echo "$RESUME_BASE64" | base64 -d > data/resume.pdf
+          echo "Resume saved"
+        else
+          echo "Warning: RESUME_BASE64 secret not set"
+          python scripts/create_dummy_resume.py
+        fi
+    
+    - name: Configure environment
+      env:
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        INDEED_API_KEY: ${{ secrets.INDEED_API_KEY }}
+        LINKEDIN_API_KEY: ${{ secrets.LINKEDIN_API_KEY }}
+        EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+        EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        NOTIFICATION_EMAIL: ${{ secrets.NOTIFICATION_EMAIL }}
+      run: |
+        cat > .env << EOF
+        OPENAI_API_KEY=${OPENAI_API_KEY}
+        INDEED_API_KEY=${INDEED_API_KEY}
+        LINKEDIN_API_KEY=${LINKEDIN_API_KEY}
+        EMAIL_ADDRESS=${EMAIL_ADDRESS}
+        EMAIL_PASSWORD=${EMAIL_PASSWORD}
+        NOTIFICATION_EMAIL=${NOTIFICATION_EMAIL}
+        RESUME_PATH=data/resume.pdf
+        SCHEDULER_ENABLED=false
+        MANUAL_VERIFICATION_ENABLED=true
+        DRY_RUN=false
+        EOF
+    
+    - name: Run job search agent
+      run: python -m agents.job_search_agent
+      continue-on-error: true
+    
+    - name: Run relevance scoring
+      run: python -m agents.relevance_agent
+      continue-on-error: true
+    
+    - name: Tailor resumes
+      run: python -m agents.tailoring_agent
+      continue-on-error: true
+    
+    - name: Create verification requests
+      run: python -m agents.verification_agent
+      continue-on-error: true
+    
+    - name: Send email notification
+      if: success()
+      uses: dawidd6/action-send-mail@v3
+      with:
+        server_address: smtp.gmail.com
+        server_port: 587
+        username: ${{ secrets.EMAIL_ADDRESS }}
+        password: ${{ secrets.EMAIL_PASSWORD }}
+        subject: '🎯 Job Applications Ready for Verification'
+        to: ${{ secrets.NOTIFICATION_EMAIL }}
+        from: ${{ secrets.EMAIL_ADDRESS }}
+        html_body: |
+          <h2>✅ Daily Job Search Complete</h2>
+          <p>Your job applications are ready for review and approval.</p>
+          <h3>Dashboard</h3>
+          <p><a href="https://github.com/${{ github.repository }}/issues">View Applications</a></p>
+          <h3>Summary</h3>
+          <ul>
+            <li>Check the GitHub Issues tab for pending approvals</li>
+            <li>Review each application details</li>
+            <li>Approve or reject with a comment</li>
+          </ul>
+          <p>This is an automated message from Job Application Agent.</p>
+    
+    - name: Upload logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: job-search-logs-${{ github.run_id }}
+        path: logs/
+        retention-days: 30
+    
+    - name: Create issue on failure
+      if: failure()
+      uses: actions/github-script@v7
+      with:
+        script: |
+          github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: `🔴 Job Search Agent Failed - ${new Date().toISOString().split('T')[0]}`,
+            body: `The daily job search workflow failed.\n\n[View Workflow Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
+            labels: ['bug', 'automation']
+          })
